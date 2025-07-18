@@ -54,19 +54,6 @@ export REGRU_PASSWORD="your-password"
     }
     respond "Hello from wildcard domain"
 }
-With TLS Client Certificates
-caddyfile
-example.com {
-    tls {
-        dns regru {
-            username {$REGRU_USERNAME}
-            password {$REGRU_PASSWORD}
-            tls_cert {$REGRU_TLS_CERT}
-            tls_key {$REGRU_TLS_KEY}
-        }
-    }
-    respond "Secure connection"
-}
 ```
 
 ## Development
