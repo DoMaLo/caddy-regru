@@ -112,6 +112,93 @@ func (p *CaddyDNSProvider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+func (p *Provider) findRootZone(ctx context.Context, zone string) (string, error) {
+	client, err := p.getClient()
+	if err != nil {
+		return "", fmt.Errorf("failed to create client: %w", err)
+	}
+
+	zones, err := client.GetZones(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get zones from reg.ru API: %w", err)
+	}
+
+	cleanZone := strings.TrimSuffix(zone, ".")
+
+	if p.logger != nil {
+		p.logger.Debug("Finding root zone",
+			zap.String("input_zone", cleanZone),
+			zap.Strings("available_zones", zones))
+	}
+	for _, apiZone := range zones {
+		apiZone = strings.TrimSuffix(apiZone, ".")
+		if cleanZone == apiZone {
+			if p.logger != nil {
+				p.logger.Info("Found exact root zone match",
+					zap.String("input_zone", cleanZone),
+					zap.String("root_zone", apiZone))
+			}
+			return apiZone, nil
+		}
+	}
+
+	var bestMatch string
+	for _, apiZone := range zones {
+		apiZone = strings.TrimSuffix(apiZone, ".")
+		if strings.HasSuffix(cleanZone, "."+apiZone) {
+			if len(apiZone) > len(bestMatch) {
+				bestMatch = apiZone
+			}
+		}
+	}
+
+	if bestMatch != "" {
+		if p.logger != nil {
+			p.logger.Info("Found root zone for subdomain",
+				zap.String("input_zone", cleanZone),
+				zap.String("root_zone", bestMatch))
+		}
+		return bestMatch, nil
+	}
+
+	return "", fmt.Errorf("domain '%s' not found in your reg.ru account. Available domains: %v", cleanZone, zones)
+}
+
+func (p *Provider) getSubdomain(recordName, rootZone, originalZone string) string {
+	recordName = strings.TrimSuffix(recordName, ".")
+	rootZone = strings.TrimSuffix(rootZone, ".")
+	originalZone = strings.TrimSuffix(originalZone, ".")
+
+	if p.logger != nil {
+		p.logger.Debug("Computing subdomain",
+			zap.String("record_name", recordName),
+			zap.String("root_zone", rootZone),
+			zap.String("original_zone", originalZone))
+	}
+
+	if recordName == "" || recordName == "@" || recordName == rootZone {
+		return ""
+	}
+
+	if strings.HasSuffix(recordName, "."+rootZone) {
+		return strings.TrimSuffix(recordName, "."+rootZone)
+	}
+
+	if originalZone != rootZone {
+		if strings.HasSuffix(originalZone, "."+rootZone) {
+			zonePrefix := strings.TrimSuffix(originalZone, "."+rootZone)
+			if recordName == zonePrefix {
+				return recordName
+			}
+			if zonePrefix != "" {
+				return recordName + "." + zonePrefix
+			}
+		}
+	}
+
+	return recordName
+}
+
 // GetRecords lists DNS records for the given zone.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
 	if p.logger != nil {
@@ -131,6 +218,12 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 
 	if zone == "" {
 		return nil, fmt.Errorf("regru: zone cannot be empty")
+	}
+
+	// Находим корневую зону через API reg.ru
+	rootZone, err := p.findRootZone(ctx, zone)
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := p.getClient()
@@ -153,39 +246,28 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 			return nil, fmt.Errorf("only TXT records are supported, got: %s", rr.Type)
 		}
 
-		// Нормализуем зону
-		cleanZone := strings.TrimSuffix(zone, ".")
-
-		// Обрабатываем имя записи
-		recordName := strings.TrimSuffix(rr.Name, ".")
-		var subDomain string
-
-		if recordName == "" || recordName == "@" || recordName == cleanZone {
-			subDomain = ""
-		} else if strings.HasSuffix(recordName, "."+cleanZone) {
-			subDomain = strings.TrimSuffix(recordName, "."+cleanZone)
-		} else {
-			subDomain = recordName
-		}
+		// Вычисляем поддомен с учетом originalZone
+		subDomain := p.getSubdomain(rr.Name, rootZone, zone)
 
 		if p.logger != nil {
 			p.logger.Info("Adding TXT record",
-				zap.String("zone", cleanZone),
+				zap.String("root_zone", rootZone),
 				zap.String("subdomain", subDomain),
 				zap.String("value", rr.Data),
-				zap.String("original_name", recordName))
+				zap.String("original_name", rr.Name),
+				zap.String("original_zone", zone))
 		}
 
-		err := client.AddTXTRecord(ctx, cleanZone, subDomain, rr.Data)
+		err := client.AddTXTRecord(ctx, rootZone, subDomain, rr.Data)
 		if err != nil {
 			if p.logger != nil {
 				p.logger.Error("Failed to add TXT record",
-					zap.String("zone", cleanZone),
+					zap.String("root_zone", rootZone),
 					zap.String("subdomain", subDomain),
 					zap.String("value", rr.Data),
 					zap.Error(err))
 			}
-			return nil, fmt.Errorf("failed to add TXT record for %s: %w", recordName, err)
+			return nil, fmt.Errorf("failed to add TXT record for %s: %w", rr.Name, err)
 		}
 
 		resultRecord := record
@@ -205,7 +287,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 
 		if p.logger != nil {
 			p.logger.Info("Successfully added TXT record",
-				zap.String("zone", cleanZone),
+				zap.String("root_zone", rootZone),
 				zap.String("subdomain", subDomain),
 				zap.String("value", rr.Data))
 		}
@@ -238,6 +320,12 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		return nil, fmt.Errorf("regru: zone cannot be empty")
 	}
 
+	// Находим корневую зону через API reg.ru
+	rootZone, err := p.findRootZone(ctx, zone)
+	if err != nil {
+		return nil, err
+	}
+
 	client, err := p.getClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client: %w", err)
@@ -258,46 +346,35 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 			return nil, fmt.Errorf("only TXT records are supported, got: %s", rr.Type)
 		}
 
-		// Нормализуем зону
-		cleanZone := strings.TrimSuffix(zone, ".")
-
-		// Обрабатываем имя записи
-		recordName := strings.TrimSuffix(rr.Name, ".")
-		var subDomain string
-
-		if recordName == "" || recordName == "@" || recordName == cleanZone {
-			subDomain = ""
-		} else if strings.HasSuffix(recordName, "."+cleanZone) {
-			subDomain = strings.TrimSuffix(recordName, "."+cleanZone)
-		} else {
-			subDomain = recordName
-		}
+		// Вычисляем поддомен с учетом originalZone
+		subDomain := p.getSubdomain(rr.Name, rootZone, zone)
 
 		if p.logger != nil {
 			p.logger.Info("Removing TXT record",
-				zap.String("zone", cleanZone),
+				zap.String("root_zone", rootZone),
 				zap.String("subdomain", subDomain),
 				zap.String("value", rr.Data),
-				zap.String("original_name", recordName))
+				zap.String("original_name", rr.Name),
+				zap.String("original_zone", zone))
 		}
 
-		err := client.RemoveTxtRecord(ctx, cleanZone, subDomain, rr.Data)
+		err := client.RemoveTxtRecord(ctx, rootZone, subDomain, rr.Data)
 		if err != nil {
 			if p.logger != nil {
 				p.logger.Error("Failed to remove TXT record",
-					zap.String("zone", cleanZone),
+					zap.String("root_zone", rootZone),
 					zap.String("subdomain", subDomain),
 					zap.String("value", rr.Data),
 					zap.Error(err))
 			}
-			return nil, fmt.Errorf("failed to remove TXT record for %s: %w", recordName, err)
+			return nil, fmt.Errorf("failed to remove TXT record for %s: %w", rr.Name, err)
 		}
 
 		results = append(results, record)
 
 		if p.logger != nil {
 			p.logger.Info("Successfully removed TXT record",
-				zap.String("zone", cleanZone),
+				zap.String("root_zone", rootZone),
 				zap.String("subdomain", subDomain),
 				zap.String("value", rr.Data))
 		}

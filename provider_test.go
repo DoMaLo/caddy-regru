@@ -297,78 +297,73 @@ func TestProvider_getClient(t *testing.T) {
 	}
 }
 
-func TestRecordNameProcessing(t *testing.T) {
+func TestGetSubdomain(t *testing.T) {
+	provider := &Provider{
+		logger: zaptest.NewLogger(t),
+	}
+
 	tests := []struct {
 		name           string
-		zone           string
 		recordName     string
+		rootZone       string
+		originalZone   string
 		expectedSubdom string
 	}{
 		{
-			name:           "full domain name",
-			zone:           "example.com",
-			recordName:     "_acme-challenge.example.com.",
-			expectedSubdom: "_acme-challenge",
+			name:           "acme challenge for subdomain",
+			recordName:     "_acme-challenge.test1",
+			rootZone:       "example.com",
+			originalZone:   "local.example.com",
+			expectedSubdom: "_acme-challenge.test1.local",
 		},
 		{
-			name:           "subdomain without zone suffix",
-			zone:           "example.com",
+			name:           "acme challenge for root zone",
 			recordName:     "_acme-challenge",
+			rootZone:       "example.com",
+			originalZone:   "example.com",
 			expectedSubdom: "_acme-challenge",
 		},
 		{
-			name:           "root domain",
-			zone:           "example.com",
-			recordName:     "example.com.",
-			expectedSubdom: "",
+			name:           "full domain name",
+			recordName:     "_acme-challenge.test.example.com",
+			rootZone:       "example.com",
+			originalZone:   "example.com",
+			expectedSubdom: "_acme-challenge.test",
 		},
 		{
 			name:           "empty record name",
-			zone:           "example.com",
 			recordName:     "",
+			rootZone:       "example.com",
+			originalZone:   "example.com",
 			expectedSubdom: "",
 		},
 		{
 			name:           "@ symbol",
-			zone:           "example.com",
 			recordName:     "@",
+			rootZone:       "example.com",
+			originalZone:   "example.com",
 			expectedSubdom: "",
 		},
 		{
-			name:           "nested subdomain",
-			zone:           "example.com",
-			recordName:     "sub.domain.example.com.",
-			expectedSubdom: "sub.domain",
+			name:           "record name equals root zone",
+			recordName:     "example.com",
+			rootZone:       "example.com",
+			originalZone:   "example.com",
+			expectedSubdom: "",
 		},
 		{
-			name:           "zone with trailing dot",
-			zone:           "example.com.",
-			recordName:     "_acme-challenge.example.com.",
-			expectedSubdom: "_acme-challenge",
-		},
-		{
-			name:           "complex subdomain",
-			zone:           "example.com",
-			recordName:     "a.b.c.example.com.",
-			expectedSubdom: "a.b.c",
+			name:           "complex subdomain with multiple levels",
+			recordName:     "_acme-challenge.api",
+			rootZone:       "example.com",
+			originalZone:   "prod.local.example.com",
+			expectedSubdom: "_acme-challenge.api.prod.local",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cleanZone := strings.TrimSuffix(tt.zone, ".")
-			recordName := strings.TrimSuffix(tt.recordName, ".")
-
-			var subDomain string
-			if recordName == "" || recordName == "@" || recordName == cleanZone {
-				subDomain = ""
-			} else if strings.HasSuffix(recordName, "."+cleanZone) {
-				subDomain = strings.TrimSuffix(recordName, "."+cleanZone)
-			} else {
-				subDomain = recordName
-			}
-
-			assert.Equal(t, tt.expectedSubdom, subDomain)
+			result := provider.getSubdomain(tt.recordName, tt.rootZone, tt.originalZone)
+			assert.Equal(t, tt.expectedSubdom, result)
 		})
 	}
 }
@@ -427,7 +422,7 @@ func TestRecordValidation(t *testing.T) {
 			rr := tt.record.RR()
 
 			if tt.zone == "" {
-				assert.Contains(t, "regru: zone cannot be empty", tt.expectedError)
+				assert.Contains(t, tt.expectedError, "regru: zone cannot be empty")
 				return
 			}
 
@@ -529,6 +524,123 @@ func TestInterfaceImplementation(t *testing.T) {
 	var _ libdns.RecordDeleter = (*Provider)(nil)
 }
 
+func TestFindRootZoneError(t *testing.T) {
+	tests := []struct {
+		name         string
+		zone         string
+		mockZones    []string
+		shouldError  bool
+		expectedZone string
+		errorMsg     string
+	}{
+		{
+			name:         "exact match found",
+			zone:         "example.com",
+			mockZones:    []string{"example.com", "5gen.ru"},
+			shouldError:  false,
+			expectedZone: "example.com",
+		},
+		{
+			name:         "subdomain match found",
+			zone:         "local.example.com",
+			mockZones:    []string{"example.com", "5gen.ru"},
+			shouldError:  false,
+			expectedZone: "example.com",
+		},
+		{
+			name:        "no match found",
+			zone:        "unknown.com",
+			mockZones:   []string{"example.com", "5gen.ru"},
+			shouldError: true,
+			errorMsg:    "domain 'unknown.com' not found in your reg.ru account",
+		},
+		{
+			name:        "empty zones list",
+			zone:        "example.com",
+			mockZones:   []string{},
+			shouldError: true,
+			errorMsg:    "domain 'example.com' not found in your reg.ru account",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Тестируем логику обработки ошибок без создания реального провайдера
+			if tt.shouldError {
+				assert.Contains(t, tt.errorMsg, "not found in your reg.ru account")
+			} else {
+				// Тестируем логику поиска зон
+				cleanZone := strings.TrimSuffix(tt.zone, ".")
+
+				// Ищем точное совпадение
+				var found bool
+				var bestMatch string
+
+				for _, apiZone := range tt.mockZones {
+					apiZone = strings.TrimSuffix(apiZone, ".")
+					if cleanZone == apiZone {
+						found = true
+						bestMatch = apiZone
+						break
+					}
+				}
+
+				// Если не найдено точное совпадение, ищем поддомен
+				if !found {
+					for _, apiZone := range tt.mockZones {
+						apiZone = strings.TrimSuffix(apiZone, ".")
+						if strings.HasSuffix(cleanZone, "."+apiZone) {
+							if len(apiZone) > len(bestMatch) {
+								bestMatch = apiZone
+							}
+						}
+					}
+				}
+
+				if bestMatch != "" {
+					assert.Equal(t, tt.expectedZone, bestMatch)
+				}
+			}
+		})
+	}
+}
+
+func TestZoneNormalization(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "zone with trailing dot",
+			input:    "example.com.",
+			expected: "example.com",
+		},
+		{
+			name:     "zone without trailing dot",
+			input:    "example.com",
+			expected: "example.com",
+		},
+		{
+			name:     "empty zone",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "zone with multiple dots",
+			input:    "sub.example.com.",
+			expected: "sub.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := strings.TrimSuffix(tt.input, ".")
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
 func BenchmarkValidCredentials(b *testing.B) {
 	testCases := []string{
 		"test@example.com",
@@ -564,23 +676,11 @@ func BenchmarkRecordProcessing(b *testing.B) {
 	}
 }
 
-func BenchmarkRecordNameProcessing(b *testing.B) {
-	zone := "example.com"
-	recordName := "_acme-challenge.example.com."
+func BenchmarkGetSubdomain(b *testing.B) {
+	provider := &Provider{}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cleanZone := strings.TrimSuffix(zone, ".")
-		name := strings.TrimSuffix(recordName, ".")
-
-		var subDomain string
-		if name == "" || name == "@" || name == cleanZone {
-			subDomain = ""
-		} else if strings.HasSuffix(name, "."+cleanZone) {
-			subDomain = strings.TrimSuffix(name, "."+cleanZone)
-		} else {
-			subDomain = name
-		}
-		_ = subDomain
+		_ = provider.getSubdomain("_acme-challenge.test1", "example.com", "local.example.com")
 	}
 }

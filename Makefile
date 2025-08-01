@@ -28,7 +28,7 @@ deps:
 
 # Build Caddy with this plugin using xcaddy
 build-caddy:
-	xcaddy build --with github.com/DoMaLo/caddy-regru=./
+	~/go/bin/xcaddy build --with github.com/DoMaLo/caddy-regru=./
 
 # Run Caddy with example config (requires build-caddy first)
 run-example: build-caddy

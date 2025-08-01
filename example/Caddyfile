@@ -2,7 +2,54 @@
     http_port 8080
 }
 
-test.example.com:4433 {
+https://test1.local.example.com:4433 {
+    tls admin@example.com {
+        dns regru {
+                username {$REG_USER}
+                password {$REG_PASS}
+        }
+        propagation_timeout -1
+        propagation_delay 10m
+        # staging ca
+        ca https://acme-staging-v02.api.letsencrypt.org/directory
+    }
+    respond /health-check 200
+	respond "Hello, world!"        
+}
+    
+https://test1.example.com:4433 {
+    tls admin@example.com {
+        dns regru {
+                username {$REG_USER}
+                password {$REG_PASS}
+        }
+        propagation_timeout -1
+        propagation_delay 10m
+        # staging ca
+        ca https://acme-staging-v02.api.letsencrypt.org/directory
+    }
+    respond /health-check 200
+	respond "Hello, world!"        
+}
+    
+
+    
+https://*.test1.example.com:4433 {
+    tls admin@example.com {
+        dns regru {
+                username {$REG_USER}
+                password {$REG_PASS}
+        }
+        propagation_timeout -1
+        propagation_delay 10m
+        # staging ca
+        ca https://acme-staging-v02.api.letsencrypt.org/directory
+    }
+    respond /health-check 200
+	respond "Hello, world!"        
+}
+    
+https://*.example.com:4433 {
     tls admin@example.com {
         dns regru {
                 username {$REG_USER}

@@ -1,4 +1,3 @@
-// internal/client.go
 package internal
 
 import (
@@ -41,6 +40,23 @@ type APIResponse struct {
 	ErrorCode string      `json:"error_code"`
 	ErrorText string      `json:"error_text"`
 	Answer    interface{} `json:"answer"`
+}
+
+// Service represents a service in the reg.ru API response
+type Service struct {
+	CreationDate    string `json:"creation_date"`
+	DName           string `json:"dname"`
+	ExpirationDate  string `json:"expiration_date"`
+	ServiceID       int    `json:"service_id"`
+	ServType        string `json:"servtype"`
+	State           string `json:"state"`
+	SubType         string `json:"subtype"`
+	UplinkServiceID int    `json:"uplink_service_id"`
+}
+
+// ServicesResponse represents the response structure for service/get_list
+type ServicesResponse struct {
+	Services []Service `json:"services"`
 }
 
 // AddTXTRecord adds a TXT record to the specified domain
@@ -155,7 +171,7 @@ func (c *Client) makeAPIRequest(ctx context.Context, method string, params map[s
 	return &apiResp, nil
 }
 
-// GetZones получает список доменов (зон) для отладки
+// GetZones получает список доменов через service/get_list
 func (c *Client) GetZones(ctx context.Context) ([]string, error) {
 	params := map[string]string{
 		"username":            c.Username,
@@ -163,24 +179,35 @@ func (c *Client) GetZones(ctx context.Context) ([]string, error) {
 		"output_content_type": "json",
 	}
 
-	resp, err := c.makeAPIRequest(ctx, "domain/get_list", params)
+	resp, err := c.makeAPIRequest(ctx, "service/get_list", params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get zones: %w", err)
+		return nil, fmt.Errorf("failed to get services: %w", err)
 	}
 
 	if resp.Result != "success" {
-		return nil, fmt.Errorf("API error getting zones: %s - %s", resp.ErrorCode, resp.ErrorText)
+		return nil, fmt.Errorf("API error getting services: %s - %s", resp.ErrorCode, resp.ErrorText)
 	}
 
 	// Парсим ответ для получения списка доменов
 	var zones []string
+	var uniqueZones = make(map[string]bool)
+
 	if resp.Answer != nil {
 		if answerMap, ok := resp.Answer.(map[string]interface{}); ok {
-			if domains, ok := answerMap["domains"].([]interface{}); ok {
-				for _, domain := range domains {
-					if domainMap, ok := domain.(map[string]interface{}); ok {
-						if name, ok := domainMap["dname"].(string); ok {
-							zones = append(zones, name)
+			if services, ok := answerMap["services"].([]interface{}); ok {
+				for _, service := range services {
+					if serviceMap, ok := service.(map[string]interface{}); ok {
+						// Проверяем что это домен и он активен
+						if servType, ok := serviceMap["servtype"].(string); ok && servType == "domain" {
+							if state, ok := serviceMap["state"].(string); ok && state == "A" {
+								if dname, ok := serviceMap["dname"].(string); ok && dname != "" {
+									// Добавляем только уникальные домены
+									if !uniqueZones[dname] {
+										zones = append(zones, dname)
+										uniqueZones[dname] = true
+									}
+								}
+							}
 						}
 					}
 				}
