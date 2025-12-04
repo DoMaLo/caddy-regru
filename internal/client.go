@@ -11,15 +11,21 @@ import (
 	"time"
 )
 
-// DefaultTimeout is the default timeout for HTTP requests
-const DefaultTimeout = 30 * time.Second
+const (
+	// DefaultTimeout is the default timeout for HTTP requests
+	DefaultTimeout = 30 * time.Second
+	// DefaultUserAgent is the default User-Agent header for API requests
+	DefaultUserAgent = "caddy-regru-dns-provider/1.0"
+	// DefaultBaseURL is the default base URL for reg.ru API
+	DefaultBaseURL = "https://api.reg.ru/api/regru2"
+)
 
 // Client represents a reg.ru API client
 type Client struct {
 	Username   string
 	Password   string
 	HTTPClient *http.Client
-	BaseURL    string // Делаем BaseURL полем структуры
+	BaseURL    string
 }
 
 // NewClient creates a new reg.ru API client
@@ -27,7 +33,7 @@ func NewClient(username, password string) *Client {
 	return &Client{
 		Username: username,
 		Password: password,
-		BaseURL:  "https://api.reg.ru/api/regru2", // Значение по умолчанию
+		BaseURL:  DefaultBaseURL,
 		HTTPClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
@@ -59,9 +65,10 @@ type ServicesResponse struct {
 	Services []Service `json:"services"`
 }
 
-// AddTXTRecord adds a TXT record to the specified domain
+// AddTXTRecord adds a TXT record to the specified domain using reg.ru API.
+// The subdomain parameter can be empty for root domain records.
 func (c *Client) AddTXTRecord(ctx context.Context, domain, subdomain, value string) error {
-	// Подготавливаем параметры для API запроса
+	// Prepare parameters for API request
 	params := map[string]string{
 		"username":            c.Username,
 		"password":            c.Password,
@@ -72,13 +79,13 @@ func (c *Client) AddTXTRecord(ctx context.Context, domain, subdomain, value stri
 		"output_content_type": "json",
 	}
 
-	// Выполняем API запрос
+	// Execute API request
 	resp, err := c.makeAPIRequest(ctx, "zone/add_txt", params)
 	if err != nil {
 		return fmt.Errorf("failed to make API request: %w", err)
 	}
 
-	// Проверяем ответ API
+	// Check API response
 	if resp.Result != "success" {
 		if resp.ErrorCode != "" {
 			return fmt.Errorf("API error: %s - %s (domain: %s, subdomain: %s)",
@@ -91,9 +98,11 @@ func (c *Client) AddTXTRecord(ctx context.Context, domain, subdomain, value stri
 	return nil
 }
 
-// RemoveTxtRecord removes a TXT record from the specified domain
+// RemoveTxtRecord removes a TXT record from the specified domain using reg.ru API.
+// The subdomain parameter can be empty for root domain records.
+// The value parameter must match exactly the value of the record to be removed.
 func (c *Client) RemoveTxtRecord(ctx context.Context, domain, subdomain, value string) error {
-	// Подготавливаем параметры для API запроса
+	// Prepare parameters for API request
 	params := map[string]string{
 		"username":            c.Username,
 		"password":            c.Password,
@@ -104,13 +113,13 @@ func (c *Client) RemoveTxtRecord(ctx context.Context, domain, subdomain, value s
 		"output_content_type": "json",
 	}
 
-	// Выполняем API запрос
+	// Execute API request
 	resp, err := c.makeAPIRequest(ctx, "zone/remove_record", params)
 	if err != nil {
 		return fmt.Errorf("failed to make API request: %w", err)
 	}
 
-	// Проверяем ответ API
+	// Check API response
 	if resp.Result != "success" {
 		if resp.ErrorCode != "" {
 			return fmt.Errorf("API error: %s - %s (domain: %s, subdomain: %s)",
@@ -123,46 +132,47 @@ func (c *Client) RemoveTxtRecord(ctx context.Context, domain, subdomain, value s
 	return nil
 }
 
-// makeAPIRequest выполняет HTTP запрос к API reg.ru
+// makeAPIRequest performs an HTTP POST request to reg.ru API.
+// It handles request creation, error checking, and response parsing.
 func (c *Client) makeAPIRequest(ctx context.Context, method string, params map[string]string) (*APIResponse, error) {
-	// Создаем URL
+	// Create URL
 	apiURL := fmt.Sprintf("%s/%s", c.BaseURL, method)
 
-	// Подготавливаем form data
+	// Prepare form data
 	formData := url.Values{}
 	for key, value := range params {
 		formData.Set(key, value)
 	}
 
-	// Создаем HTTP запрос
+	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, strings.NewReader(formData.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Устанавливаем заголовки
+	// Set headers
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "caddy-regru-dns-provider/1.0")
+	req.Header.Set("User-Agent", DefaultUserAgent)
 
-	// Выполняем запрос
+	// Execute request
 	httpResp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer httpResp.Body.Close()
 
-	// Читаем ответ
+	// Read response
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Проверяем HTTP статус
+	// Check HTTP status
 	if httpResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("API request failed with status %d: %s", httpResp.StatusCode, string(body))
 	}
 
-	// Парсим JSON ответ
+	// Parse JSON response
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
 		return nil, fmt.Errorf("failed to parse API response: %w (body: %s)", err, string(body))
@@ -171,7 +181,8 @@ func (c *Client) makeAPIRequest(ctx context.Context, method string, params map[s
 	return &apiResp, nil
 }
 
-// GetZones получает список доменов через service/get_list
+// GetZones retrieves a list of active domains from reg.ru account using service/get_list API.
+// Only domains with state "A" (Active) are returned. Duplicate domains are filtered out.
 func (c *Client) GetZones(ctx context.Context) ([]string, error) {
 	params := map[string]string{
 		"username":            c.Username,
@@ -188,29 +199,34 @@ func (c *Client) GetZones(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("API error getting services: %s - %s", resp.ErrorCode, resp.ErrorText)
 	}
 
-	// Парсим ответ для получения списка доменов
-	var zones []string
-	var uniqueZones = make(map[string]bool)
+	// Parse response using structured format
+	if resp.Answer == nil {
+		return []string{}, nil
+	}
 
-	if resp.Answer != nil {
-		if answerMap, ok := resp.Answer.(map[string]interface{}); ok {
-			if services, ok := answerMap["services"].([]interface{}); ok {
-				for _, service := range services {
-					if serviceMap, ok := service.(map[string]interface{}); ok {
-						// Проверяем что это домен и он активен
-						if servType, ok := serviceMap["servtype"].(string); ok && servType == "domain" {
-							if state, ok := serviceMap["state"].(string); ok && state == "A" {
-								if dname, ok := serviceMap["dname"].(string); ok && dname != "" {
-									// Добавляем только уникальные домены
-									if !uniqueZones[dname] {
-										zones = append(zones, dname)
-										uniqueZones[dname] = true
-									}
-								}
-							}
-						}
-					}
-				}
+	var servicesResp struct {
+		Services []Service `json:"services"`
+	}
+
+	// Convert Answer to JSON bytes and unmarshal
+	answerBytes, err := json.Marshal(resp.Answer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal API answer: %w", err)
+	}
+
+	if err := json.Unmarshal(answerBytes, &servicesResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal services response: %w", err)
+	}
+
+	// Filter active domains and remove duplicates
+	uniqueZones := make(map[string]bool)
+	var zones []string
+
+	for _, service := range servicesResp.Services {
+		if service.ServType == "domain" && service.State == "A" && service.DName != "" {
+			if !uniqueZones[service.DName] {
+				zones = append(zones, service.DName)
+				uniqueZones[service.DName] = true
 			}
 		}
 	}

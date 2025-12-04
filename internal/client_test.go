@@ -317,8 +317,8 @@ func TestClient_GetZones(t *testing.T) {
 					"services": "invalid-data",
 				},
 			},
-			expectError:   false,
-			expectedZones: []string{},
+			expectError: true,
+			errorMsg:    "failed to unmarshal services response",
 		},
 		{
 			name:         "duplicate domains filtered",

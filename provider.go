@@ -15,6 +15,11 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// defaultTTL is the default TTL for DNS records when not specified
+	defaultTTL = 5 * time.Minute
+)
+
 // credentialsRegexp matches basic email format for username
 var credentialsRegexp = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
 
@@ -22,8 +27,6 @@ var credentialsRegexp = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[
 type Provider struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
-	TLSCert  string `json:"tls_cert,omitempty"`
-	TLSKey   string `json:"tls_key,omitempty"`
 
 	logger *zap.Logger
 }
@@ -47,10 +50,8 @@ func (CaddyDNSProvider) CaddyModule() caddy.ModuleInfo {
 func (p *CaddyDNSProvider) Provision(ctx caddy.Context) error {
 	p.Provider.logger = ctx.Logger()
 
-	replacer := caddy.NewReplacer()
-	p.Provider.Username = replacer.ReplaceAll(p.Provider.Username, "")
-	p.Provider.Password = replacer.ReplaceAll(p.Provider.Password, "")
-
+	// Environment variables are replaced automatically during Caddyfile parsing
+	// If using JSON config, use caddy.NewReplacer() to replace variables
 	if p.Provider.Username == "" {
 		return fmt.Errorf("regru: username is required")
 	}
@@ -112,6 +113,8 @@ func (p *CaddyDNSProvider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// findRootZone finds the root zone for the given zone name by querying reg.ru API.
+// It handles both exact matches and subdomain matches (e.g., "sub.example.com" -> "example.com").
 func (p *Provider) findRootZone(ctx context.Context, zone string) (string, error) {
 	client, err := p.getClient()
 	if err != nil {
@@ -124,6 +127,8 @@ func (p *Provider) findRootZone(ctx context.Context, zone string) (string, error
 	}
 
 	cleanZone := strings.TrimSuffix(zone, ".")
+	// Remove wildcard prefix if present (e.g., "*.test.com" -> "test.com")
+	cleanZone = strings.TrimPrefix(cleanZone, "*.")
 
 	if p.logger != nil {
 		p.logger.Debug("Finding root zone",
@@ -164,10 +169,16 @@ func (p *Provider) findRootZone(ctx context.Context, zone string) (string, error
 	return "", fmt.Errorf("domain '%s' not found in your reg.ru account. Available domains: %v", cleanZone, zones)
 }
 
+// getSubdomain computes the subdomain name for a DNS record, taking into account
+// the root zone and original zone. It handles various edge cases like empty record names,
+// "@" symbols, and multi-level subdomains.
 func (p *Provider) getSubdomain(recordName, rootZone, originalZone string) string {
 	recordName = strings.TrimSuffix(recordName, ".")
 	rootZone = strings.TrimSuffix(rootZone, ".")
 	originalZone = strings.TrimSuffix(originalZone, ".")
+
+	// Remove wildcard prefix from originalZone if present (e.g., "*.test.com" -> "test.com")
+	originalZone = strings.TrimPrefix(originalZone, "*.")
 
 	if p.logger != nil {
 		p.logger.Debug("Computing subdomain",
@@ -200,6 +211,14 @@ func (p *Provider) getSubdomain(recordName, rootZone, originalZone string) strin
 }
 
 // GetRecords lists DNS records for the given zone.
+//
+// NOTE: This method is not fully implemented because reg.ru API 2.0 does not
+// provide a method to retrieve DNS records from a zone. The API only supports
+// adding (zone/add_txt) and removing (zone/remove_record) records.
+//
+// This method is required by the libdns.RecordGetter interface but is not used
+// by Certmagic for ACME DNS-01 challenges, which only require AppendRecords
+// and DeleteRecords. Returning an empty list satisfies the interface contract.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
 	if p.logger != nil {
 		p.logger.Info("GetRecords called", zap.String("zone", zone))
@@ -209,6 +228,10 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 }
 
 // AppendRecords adds DNS records to the given zone.
+//
+// This method is used by Certmagic to add TXT records for ACME DNS-01 challenges.
+// Only TXT records are supported. The method automatically finds the root zone
+// for subdomains and computes the correct subdomain name for the DNS record.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	if p.logger != nil {
 		p.logger.Info("AppendRecords called",
@@ -220,7 +243,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		return nil, fmt.Errorf("regru: zone cannot be empty")
 	}
 
-	// Находим корневую зону через API reg.ru
+	// Find root zone through reg.ru API
 	rootZone, err := p.findRootZone(ctx, zone)
 	if err != nil {
 		return nil, err
@@ -239,14 +262,15 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 				zap.Any("record", record))
 		}
 
-		// Получаем RR из Record
+		// Get RR from Record
 		rr := record.RR()
 
+		// Validate record type
 		if rr.Type != "TXT" {
 			return nil, fmt.Errorf("only TXT records are supported, got: %s", rr.Type)
 		}
 
-		// Вычисляем поддомен с учетом originalZone
+		// Compute subdomain taking into account originalZone
 		subDomain := p.getSubdomain(rr.Name, rootZone, zone)
 
 		if p.logger != nil {
@@ -274,7 +298,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		resultRR := resultRecord.RR()
 
 		if resultRR.TTL == 0 {
-			resultRR.TTL = 5 * time.Minute
+			resultRR.TTL = defaultTTL
 		}
 
 		if txtRecord, ok := resultRecord.(*libdns.TXT); ok {
@@ -297,6 +321,10 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 }
 
 // SetRecords replaces DNS records in the given zone.
+//
+// For reg.ru API, SetRecords works the same as AppendRecords because the API
+// doesn't support querying existing records. This method is used by Certmagic
+// to ensure DNS records are set correctly for ACME challenges.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	if p.logger != nil {
 		p.logger.Info("SetRecords called",
@@ -304,11 +332,15 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			zap.Int("record_count", len(records)))
 	}
 
-	// Для reg.ru SetRecords работает так же, как AppendRecords
+	// For reg.ru API, SetRecords works the same as AppendRecords
 	return p.AppendRecords(ctx, zone, records)
 }
 
 // DeleteRecords removes DNS records from the given zone.
+//
+// This method is used by Certmagic to clean up TXT records after ACME DNS-01
+// challenge validation. Only TXT records are supported. The method automatically
+// finds the root zone for subdomains and computes the correct subdomain name.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	if p.logger != nil {
 		p.logger.Info("DeleteRecords called",
@@ -320,7 +352,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		return nil, fmt.Errorf("regru: zone cannot be empty")
 	}
 
-	// Находим корневую зону через API reg.ru
+	// Find root zone through reg.ru API
 	rootZone, err := p.findRootZone(ctx, zone)
 	if err != nil {
 		return nil, err
@@ -339,14 +371,15 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 				zap.Any("record", record))
 		}
 
-		// Получаем RR из Record
+		// Get RR from Record
 		rr := record.RR()
 
+		// Validate record type
 		if rr.Type != "TXT" {
 			return nil, fmt.Errorf("only TXT records are supported, got: %s", rr.Type)
 		}
 
-		// Вычисляем поддомен с учетом originalZone
+		// Compute subdomain taking into account originalZone
 		subDomain := p.getSubdomain(rr.Name, rootZone, zone)
 
 		if p.logger != nil {
@@ -383,7 +416,8 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	return results, nil
 }
 
-// getClient creates an HTTP client configured for reg.ru API
+// getClient creates and returns a new HTTP client configured for reg.ru API.
+// It validates that both username and password are provided before creating the client.
 func (p *Provider) getClient() (*internal.Client, error) {
 	if p.Username == "" || p.Password == "" {
 		return nil, errors.New("regru: incomplete credentials, missing username and/or password")

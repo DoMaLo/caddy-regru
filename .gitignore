@@ -1,3 +1,4 @@
 vendor
 caddy
 .env
+example/Caddyfile.test
