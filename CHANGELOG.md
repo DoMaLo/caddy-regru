@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.1.1] - 2025-02-26
+
+### Fixed
+- REG.RU API `zone/add_txt`: use parameter `text` instead of `content`, remove redundant `record_type` (per official API docs)
+
 ## [v0.1.0] - 2025-11-26
 
 ### Added

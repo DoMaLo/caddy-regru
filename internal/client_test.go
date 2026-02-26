@@ -788,8 +788,7 @@ func TestClient_RequestParameters(t *testing.T) {
 		"password":            "password123",
 		"domain_name":         "example.com",
 		"subdomain":           "test",
-		"content":             "test-value",
-		"record_type":         "TXT",
+		"text":                "test-value",
 		"output_content_type": "json",
 	}
 

@@ -66,6 +66,7 @@ type ServicesResponse struct {
 }
 
 // AddTXTRecord adds a TXT record to the specified domain using reg.ru API.
+// API: zone/add_txt — subdomain, text; service id: domain_name (see REG.RU API 2 docs, zone/add_txt).
 // The subdomain parameter can be empty for root domain records.
 func (c *Client) AddTXTRecord(ctx context.Context, domain, subdomain, value string) error {
 	// Prepare parameters for API request
@@ -74,8 +75,7 @@ func (c *Client) AddTXTRecord(ctx context.Context, domain, subdomain, value stri
 		"password":            c.Password,
 		"domain_name":         domain,
 		"subdomain":           subdomain,
-		"content":             value,
-		"record_type":         "TXT",
+		"text":                value,
 		"output_content_type": "json",
 	}
 
@@ -99,6 +99,7 @@ func (c *Client) AddTXTRecord(ctx context.Context, domain, subdomain, value stri
 }
 
 // RemoveTxtRecord removes a TXT record from the specified domain using reg.ru API.
+// API: zone/remove_record — subdomain, record_type (required), content (optional; we pass it for exact match).
 // The subdomain parameter can be empty for root domain records.
 // The value parameter must match exactly the value of the record to be removed.
 func (c *Client) RemoveTxtRecord(ctx context.Context, domain, subdomain, value string) error {
