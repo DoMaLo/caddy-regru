@@ -173,7 +173,7 @@ func (c *Client) cachedZones() ([]string, bool) {
 	c.zonesMu.RLock()
 	defer c.zonesMu.RUnlock()
 
-	if len(c.zonesCache) == 0 || c.zonesCached.IsZero() {
+	if c.zonesCached.IsZero() {
 		return nil, false
 	}
 

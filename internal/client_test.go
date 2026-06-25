@@ -1013,6 +1013,50 @@ func TestClient_GetZones_Cache(t *testing.T) {
 	}
 }
 
+func TestClient_GetZones_CachesEmptyZones(t *testing.T) {
+	var calls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "service/get_list") {
+			calls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(APIResponse{
+			Result: "success",
+			Answer: map[string]interface{}{
+				"services": []interface{}{},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.zonesTTL = time.Hour
+
+	ctx := context.Background()
+
+	zones1, err := client.GetZones(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error on first GetZones: %v", err)
+	}
+	zones2, err := client.GetZones(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error on second GetZones: %v", err)
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected empty zones to be cached with 1 API call, got %d", calls.Load())
+	}
+	if len(zones1) != 0 {
+		t.Fatalf("expected empty zones from first call, got %v", zones1)
+	}
+	if len(zones2) != 0 {
+		t.Fatalf("expected empty zones from second call, got %v", zones2)
+	}
+}
+
 func TestClient_GetZones_CacheExpiry(t *testing.T) {
 	var calls atomic.Int32
 
