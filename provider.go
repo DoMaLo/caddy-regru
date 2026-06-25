@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DoMaLo/caddy-regru/internal"
@@ -29,6 +30,10 @@ type Provider struct {
 	Password string `json:"password,omitempty"`
 
 	logger *zap.Logger
+
+	clientOnce sync.Once
+	client     *internal.Client
+	clientErr  error
 }
 
 // CaddyDNSProvider wraps the provider implementation as a Caddy module.
@@ -126,23 +131,29 @@ func (p *Provider) findRootZone(ctx context.Context, zone string) (string, error
 		return "", fmt.Errorf("failed to get zones from reg.ru API: %w", err)
 	}
 
-	cleanZone := strings.TrimSuffix(zone, ".")
-	// Remove wildcard prefix if present (e.g., "*.test.com" -> "test.com")
-	cleanZone = strings.TrimPrefix(cleanZone, "*.")
+	rootZone, err := resolveRootZone(zone, zones)
+	if err != nil {
+		return "", err
+	}
 
 	if p.logger != nil {
-		p.logger.Debug("Finding root zone",
+		cleanZone := strings.TrimSuffix(zone, ".")
+		cleanZone = strings.TrimPrefix(cleanZone, "*.")
+		p.logger.Info("Resolved root zone",
 			zap.String("input_zone", cleanZone),
-			zap.Strings("available_zones", zones))
+			zap.String("root_zone", rootZone))
 	}
+
+	return rootZone, nil
+}
+
+func resolveRootZone(zone string, zones []string) (string, error) {
+	cleanZone := strings.TrimSuffix(zone, ".")
+	cleanZone = strings.TrimPrefix(cleanZone, "*.")
+
 	for _, apiZone := range zones {
 		apiZone = strings.TrimSuffix(apiZone, ".")
 		if cleanZone == apiZone {
-			if p.logger != nil {
-				p.logger.Info("Found exact root zone match",
-					zap.String("input_zone", cleanZone),
-					zap.String("root_zone", apiZone))
-			}
 			return apiZone, nil
 		}
 	}
@@ -158,11 +169,6 @@ func (p *Provider) findRootZone(ctx context.Context, zone string) (string, error
 	}
 
 	if bestMatch != "" {
-		if p.logger != nil {
-			p.logger.Info("Found root zone for subdomain",
-				zap.String("input_zone", cleanZone),
-				zap.String("root_zone", bestMatch))
-		}
 		return bestMatch, nil
 	}
 
@@ -416,16 +422,23 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	return results, nil
 }
 
-// getClient creates and returns a new HTTP client configured for reg.ru API.
-// It validates that both username and password are provided before creating the client.
+// getClient returns a shared HTTP client configured for reg.ru API.
 func (p *Provider) getClient() (*internal.Client, error) {
-	if p.Username == "" || p.Password == "" {
-		return nil, errors.New("regru: incomplete credentials, missing username and/or password")
+	p.clientOnce.Do(func() {
+		if p.client != nil {
+			return
+		}
+		if p.Username == "" || p.Password == "" {
+			p.clientErr = errors.New("regru: incomplete credentials, missing username and/or password")
+			return
+		}
+		p.client = internal.NewClient(p.Username, p.Password)
+	})
+
+	if p.clientErr != nil {
+		return nil, p.clientErr
 	}
-
-	client := internal.NewClient(p.Username, p.Password)
-
-	return client, nil
+	return p.client, nil
 }
 
 // Interface guards

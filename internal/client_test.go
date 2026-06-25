@@ -3,9 +3,12 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -953,5 +956,288 @@ func TestAPIResponse_ErrorHandling(t *testing.T) {
 				t.Errorf("Expected isError %v, got %v", tt.isError, isError)
 			}
 		})
+	}
+}
+
+func successZonesResponse() APIResponse {
+	return APIResponse{
+		Result: "success",
+		Answer: map[string]interface{}{
+			"services": []interface{}{
+				map[string]interface{}{
+					"dname":    "example.com",
+					"servtype": "domain",
+					"state":    "A",
+				},
+			},
+		},
+	}
+}
+
+func TestClient_GetZones_Cache(t *testing.T) {
+	var calls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "service/get_list") {
+			calls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(successZonesResponse())
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.zonesTTL = time.Hour
+
+	ctx := context.Background()
+
+	zones1, err := client.GetZones(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error on first GetZones: %v", err)
+	}
+	zones2, err := client.GetZones(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error on second GetZones: %v", err)
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected 1 API call, got %d", calls.Load())
+	}
+	if len(zones1) != 1 || zones1[0] != "example.com" {
+		t.Fatalf("unexpected zones from first call: %v", zones1)
+	}
+	if len(zones2) != 1 || zones2[0] != "example.com" {
+		t.Fatalf("unexpected zones from second call: %v", zones2)
+	}
+}
+
+func TestClient_GetZones_CacheExpiry(t *testing.T) {
+	var calls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "service/get_list") {
+			calls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(successZonesResponse())
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.zonesTTL = 20 * time.Millisecond
+
+	ctx := context.Background()
+
+	if _, err := client.GetZones(ctx); err != nil {
+		t.Fatalf("unexpected error on first GetZones: %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if _, err := client.GetZones(ctx); err != nil {
+		t.Fatalf("unexpected error on second GetZones: %v", err)
+	}
+
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 API calls after cache expiry, got %d", calls.Load())
+	}
+}
+
+func TestClient_GetZones_ConcurrentSingleflight(t *testing.T) {
+	var calls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "service/get_list") {
+			calls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(successZonesResponse())
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.zonesTTL = time.Hour
+
+	ctx := context.Background()
+	const workers = 20
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	errCh := make(chan error, workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			zones, err := client.GetZones(ctx)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if len(zones) != 1 || zones[0] != "example.com" {
+				errCh <- fmt.Errorf("unexpected zones: %v", zones)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("unexpected error from concurrent GetZones: %v", err)
+		}
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("expected 1 API call for concurrent GetZones, got %d", calls.Load())
+	}
+}
+
+func TestClient_makeAPIRequest_Retry429(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := attempts.Add(1)
+		if count < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte("429 Too Many Requests"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(APIResponse{Result: "success"})
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.maxRetries = 5
+	client.retryBaseDelay = 1 * time.Millisecond
+	client.retryMaxDelay = 5 * time.Millisecond
+
+	ctx := context.Background()
+	resp, err := client.makeAPIRequest(ctx, "nop", map[string]string{})
+	if err != nil {
+		t.Fatalf("expected success after retries, got error: %v", err)
+	}
+	if resp.Result != "success" {
+		t.Fatalf("expected success result, got %q", resp.Result)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts.Load())
+	}
+}
+
+func TestClient_makeAPIRequest_RetryRateLimitErrorCode(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := attempts.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if count < 2 {
+			json.NewEncoder(w).Encode(APIResponse{
+				Result:    "error",
+				ErrorCode: "ACCOUNT_EXCEEDED_ALLOWED_CONNECTION_RATE",
+				ErrorText: "Rate limit exceeded",
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(APIResponse{Result: "success"})
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.maxRetries = 5
+	client.retryBaseDelay = 1 * time.Millisecond
+	client.retryMaxDelay = 5 * time.Millisecond
+
+	ctx := context.Background()
+	resp, err := client.makeAPIRequest(ctx, "nop", map[string]string{})
+	if err != nil {
+		t.Fatalf("expected success after retries, got error: %v", err)
+	}
+	if resp.Result != "success" {
+		t.Fatalf("expected success result, got %q", resp.Result)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts.Load())
+	}
+}
+
+func TestClient_makeAPIRequest_NoRetryOnPermanentError(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+	client.maxRetries = 5
+	client.retryBaseDelay = 1 * time.Millisecond
+
+	ctx := context.Background()
+	_, err := client.makeAPIRequest(ctx, "nop", map[string]string{})
+	if err == nil {
+		t.Fatal("expected error for unauthorized response")
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("expected 1 attempt without retries, got %d", attempts.Load())
+	}
+}
+
+func TestClient_RequestSerialization(t *testing.T) {
+	var concurrent atomic.Int32
+	var maxConcurrent atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := concurrent.Add(1)
+		for {
+			prev := maxConcurrent.Load()
+			if current <= prev || maxConcurrent.CompareAndSwap(prev, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		concurrent.Add(-1)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(APIResponse{Result: "success"})
+	}))
+	defer server.Close()
+
+	client := NewClient("test@example.com", "password123")
+	client.HTTPClient = server.Client()
+	client.BaseURL = server.URL
+
+	ctx := context.Background()
+	const workers = 10
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := client.makeAPIRequest(ctx, "nop", map[string]string{})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if maxConcurrent.Load() != 1 {
+		t.Fatalf("expected serialized requests (max concurrent 1), got %d", maxConcurrent.Load())
 	}
 }
